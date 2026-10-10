@@ -1,0 +1,20 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "OP6Battery", "OP6Battery.vcxproj", "{B3C2A1E0-4491-4F23-9562-F164C63E89B1}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|ARM64 = Debug|ARM64
+		Release|ARM64 = Release|ARM64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B3C2A1E0-4491-4F23-9562-F164C63E89B1}.Debug|ARM64.ActiveCfg = Debug|ARM64
+		{B3C2A1E0-4491-4F23-9562-F164C63E89B1}.Release|ARM64.ActiveCfg = Release|ARM64
+		{B3C2A1E0-4491-4F23-9562-F164C63E89B1}.Release|ARM64.Build.0 = Release|ARM64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

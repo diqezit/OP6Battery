@@ -1,0 +1,43 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.md]
+end_of_line = lf
+trim_trailing_whitespace = false
+
+[*.{c,h}]
+indent_style = space
+indent_size = 4
+
+[*.{inf,bat,cmd}]
+indent_style = space
+indent_size = 4
+
+[*.rc]
+indent_style = space
+indent_size = 4
+
+[*.{sln,vcxproj,filters,props,targets}]
+indent_style = space
+indent_size = 2
+
+[*.{yml,yaml}]
+end_of_line = lf
+indent_style = space
+indent_size = 2
+
+[*.json]
+end_of_line = lf
+indent_style = space
+indent_size = 2
+
+[LICENSE]
+end_of_line = lf
+
+[Makefile]
+indent_style = tab
