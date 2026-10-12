@@ -143,7 +143,7 @@ enum {
 // без этого канал мигает на дефолтной частоте LPG
 // PREDIV div 1 exp 1 и TYPE как в mainline qpnp-lpg
 // скважность enable SYNC не здесь: duty зависит от яркости
-// SYNC пишется последним иначе новые значения не защёлкиваются
+// SYNC пишется последним иначе новые значения не защелкиваются
 static const SPMI_WRITE lpg_seq[] = {
     { LPG_PWM_SIZE_CLK,   MASK_NONE, LPG_VAL_SIZE_CLK },  // 32 кГц, 9 бит -> ШИМ 64 Гц
     { LPG_PWM_PREDIV_CLK, MASK_NONE, LPG_VAL_PREDIV   },  // div 1 exp 1
@@ -210,8 +210,8 @@ static VOID lpg_duty(POP6_CTX c, USHORT base, USHORT duty)
       1) SIZE_CLK PREDIV TYPE из таблицы lpg_seq
       2) скважность
       3) ENABLE
-      4) на PMI8998 скважность ещё раз после ENABLE (кремниевый баг)
-      5) SYNC последним - без него новые значения не защёлкиваются
+      4) на PMI8998 скважность еще раз после ENABLE (кремниевый баг)
+      5) SYNC последним - без него новые значения не защелкиваются
 
     duty512 = 0 канал гасим но бит 5 в ENABLE оставляем как в вендоре
 */

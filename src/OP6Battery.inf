@@ -9,7 +9,7 @@ ClassGuid={72631e54-78a4-11d0-bcf7-00aa00b7b32a}
 Provider=%ManufacturerName%
 CatalogFile=op6battery.cat
 PnpLockdown=1
-DriverVer=10/09/2026,0.0.0.2
+DriverVer=10/15/2026,0.0.0.1
 
 [SourceDisksNames]
 1 = %DiskName%,,,""

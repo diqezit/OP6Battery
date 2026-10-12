@@ -137,7 +137,7 @@ static BOOLEAN spmi_rd(POP6_CTX c, USHORT reg, PUCHAR buf, ULONG n)
 */
 static NTSTATUS rdw(POP6_CTX c, USHORT reg, PUSHORT v)
 {
-    UCHAR b[2] = { 0 };
+    UCHAR b[2];
 
     // SPMI на 2 байта может не пройти читаем по одному
     if (!spmi_rd(c, reg, b, 2)) {
@@ -168,7 +168,7 @@ static NTSTATUS rdw(POP6_CTX c, USHORT reg, PUSHORT v)
 */
 BOOLEAN hw_identify(POP6_CTX c)
 {
-    UCHAR a = 0, b = 0, r = 0;
+    UCHAR a, b, r;
 
     // уже опознали раньше повторять не надо
     if (c->HwOk) return TRUE;
@@ -238,11 +238,6 @@ static BOOLEAN wrb(POP6_CTX c, USHORT reg, UCHAR mask, UCHAR val)
         Fast вставал в 1 а команда не доходила до PMIC
         термозащитная запись CHG_EN=0 с таким кодом
         гасила заряд только в воображении драйвера
-
-        5 FAILURE арбитра
-        6 DENIED
-        7 DROPPED
-        12 невалидный контекст
     */
     if (st != SPMI_SUCCESS) {
         DbgLog("wrb failed reg=0x%04X st=0x%08X", reg, st);
@@ -292,7 +287,7 @@ static BOOLEAN temp_in(POP6_CTX c, BOOLEAN hyst)
 // так же делает init mainline smb2-charger CHG_EN_SRC|POLARITY = 0
 static const SPMI_WRITE chg_seq[] = {
     { CHG_CFG2,  MASK_CFG2_EN, 0 },                        // Software Control CHG_EN из регистра не с пина
-    { CHG_FLOAT, MASK_NONE, CHG_FLOAT_VAL },               // предел напряжения 4.35 В
+    { CHG_FLOAT, MASK_NONE, CHG_FLOAT_VAL },               // предел напряжения 4.390 В
     { CHG_PRE,   MASK_PRE,  CHG_PRE_VAL   },               // ток предзаряда 1500 мА
     { CHG_FCC,   MASK_NONE, FCC_REG       },               // ток зарядки 2000 мА
     { USB_FLOAT, MASK_OPT3, FORCE_FLOAT_SDP_CFG_BIT },     // FLOAT в SDP вход не suspend-ится
@@ -312,7 +307,7 @@ static const SPMI_WRITE chg_seq[] = {
 static VOID unlock(POP6_CTX c)
 {
     ULONG i;
-    UCHAR apsd = 0, chg = 0;
+    UCHAR apsd, chg;
 
     // нет телеметрии или свежей температуры или записи по шине значит зарядник не трогаем
     if (c->Fast || !c->Hw.Valid || !c->SpmiWrite) return;
@@ -384,21 +379,22 @@ static BOOLEAN read_vbat(POP6_CTX c)
 */
 static VOID read_usb(POP6_CTX c)
 {
-    UCHAR usb_in = 0;
-    UCHAR usb_sts = 0;
+    UCHAR v;
 
     // 0x1306 (USBIN_INPUT_STATUS)
     // биты 0..5 (5V..12V) аппаратный детектор VBUS
-    if (spmi_rd(c, USB_IN_STATUS, &usb_in, 1)) {
+    if (spmi_rd(c, USB_IN_STATUS, &v, 1)) {
         c->Hw.AcFresh = TRUE;
-        c->Hw.Ac |= (BOOLEAN)((usb_in & USB_IN_VOLT_MASK) != 0);
+        if (v & USB_IN_VOLT_MASK)
+            c->Hw.Ac = TRUE;
     }
 
     // 0x1310 (USB_STS)
     // бит 4 (USBIN_PLUGIN_RT_STS) дополнительный статус
-    if (spmi_rd(c, USB_STS, &usb_sts, 1)) {
+    if (spmi_rd(c, USB_STS, &v, 1)) {
         c->Hw.AcFresh = TRUE;
-        c->Hw.Ac |= (BOOLEAN)((usb_sts & USB_STS_PRESENT_MASK) == USB_STS_PRESENT_MASK);
+        if (v & USB_STS_PRESENT_MASK)
+            c->Hw.Ac = TRUE;
     }
 }
 
@@ -443,7 +439,7 @@ static VOID read_ibat(POP6_CTX c)
 */
 static BOOLEAN read_soc(POP6_CTX c)
 {
-    UCHAR cap[2] = { 0 };
+    UCHAR cap[2];
     ULONG tries = SOC_TRIES;
 
     do {
@@ -472,15 +468,69 @@ static BOOLEAN read_soc(POP6_CTX c)
 */
 static VOID read_temp(POP6_CTX c)
 {
-    UCHAR buf[2] = { 0 };
     ULONG k10;
 
-    if (!i2c_rd(c, BQ27411_REG_TEMP, buf, sizeof(buf))) return;
-
-    k10 = MAKE_USHORT_LE(buf[0], buf[1]);
+    if (!i2c_rd(c, BQ27411_REG_TEMP, &k10)) return;
 
     c->Hw.Temp      = k10;
     c->Hw.TempFresh = TRUE;
+}
+
+/*
+    емкость банки из bq27411 по I2C
+    PMI8998 выученную емкость регистром не отдает
+    она в SRAM QG
+
+    FCC 0x0E выученная полная емкость
+    DCAP 0x3C паспортная емкость
+    читаем оба один раз до первого успеха и замораживаем
+
+    в мВт·ч: мАч gauge * BATT_NOMINAL_MV / 1000
+
+    ошибка чтения выходим без фолбека
+    следующий опрос попробует снова
+*/
+static VOID read_capacity(POP6_CTX c)
+{
+    ULONG fcc, dcap;
+
+    // уже принято: значения почти константа перечитывать нечего
+    if (c->Full) return;
+
+    if (!i2c_rd(c, BQ27411_REG_FCC,  &fcc))  return;
+    if (!i2c_rd(c, BQ27411_REG_DCAP, &dcap)) return;
+
+    // Design раньше Full: читатели ждут пару по признаку Full != 0
+    c->Design = dcap * BATT_NOMINAL_MV / 1000;
+    c->Full   = fcc * BATT_NOMINAL_MV / 1000;
+}
+
+/*
+    остаток из bq27411 регистром RC (RemainingCapacity мАч)
+    в мВт·ч переводим здесь номиналом как Full в read_capacity
+
+    читаем раз в POLL_MS для published снимка
+
+    при ошибке чтения прошлый остаток живет дальше
+    за 2 секунды значение квазистатично (как Hw.Soc у read_soc)
+*/
+static VOID read_remaining(POP6_CTX c)
+{
+    ULONG rc;
+
+    // полная емкость не принята - остаток не трогаем
+    if (!c->Full) return;
+
+    if (!i2c_rd(c, BQ27411_REG_RC, &rc)) return;
+
+    rc = rc * BATT_NOMINAL_MV / 1000;
+
+    // RC выше Full не бывает
+    // Cap/Full клампим
+    if (rc > c->Full)
+        rc = c->Full;
+
+    c->Hw.Cap = rc;
 }
 
 /*
@@ -526,27 +576,34 @@ static BOOLEAN read_mb(POP6_CTX c)
 
 /*
     один опрос батареи от начала до конца
-    SPMI основной источник mailbox резерв VBAT показывает жива ли шина
-    Valid поднимаем только когда в этом же опросе прочитали и VBAT и SOC
 
-    порядок такой
-      1) ensure_spmi открыть шину если ее нет
-      2) сбросить свежесть прошлого опроса
-      3) read_vbat нет напряжения дальше не читаем
-      4) read_usb read_ibat read_temp read_soc
-      5) итог опроса один из трех
-           A) SOC прочитан значит все хорошо Valid = TRUE mailbox снимаем
-           B) SOC нет уже SPMI_FAIL_MAX раз подряд данные протухли
-              Valid = FALSE батарея несъемная значит не исчезает а уходит в "?"
+    SPMI - основной источник
+    mailbox - запасной
+
+    Valid = TRUE только если в этом опросе прочитали и VBAT и SOC
+
+      1) открыть SPMI если еще не открыта
+
+      2) сбросить ток, кабель и температуру прошлого опроса
+         иначе после выдергивания кабеля еще долго будет "заряжается"
+         Curr = 0 значит не измерен, Ac = FALSE, TempFresh и AcFresh = FALSE
+
+      3) I2C: температура и емкость с bq27411
+         своя шина, SPMI не нужен
+         если не прочитать до BattAttach - Windows один раз возьмет Full=0
+         и больше не спросит (батарея несъемная, Tag всегда 1)
+
+      4) VBAT с SPMI - не прочитался, остальное с SPMI не трогаем
+
+      5) кабель, ток, SOC
+
+      6) итог
+           A) SOC есть      - все ок, Valid = TRUE, mailbox снимаем
+           B) SOC нет долго - данные протухли, Valid = FALSE
+              батарея несъемная, из системы не исчезает, в UI будет "?"
               шину переоткрываем
-           C) SOC нет и промахов еще мало берем снимок загрузчика
-              он держит батарею не дольше SPMI_FAIL_MAX опросов
-
-    в начале каждый опрос сбрасывает свежесть про себя
-    если оставить ток или флаг сети с прошлого раза
-    то после отключения кабеля мы бы еще долго видели зарядку
-    поэтому Curr = CURR_UNMEASURED значит не измерен Ac = FALSE
-    а TempFresh и AcFresh = FALSE значит еще не прочитаны
+           C) SOC нет мало  - берем снимок загрузчика
+              держит батарею не дольше SPMI_FAIL_MAX опросов
 */
 static VOID read_hw(POP6_CTX c)
 {
@@ -564,12 +621,16 @@ static VOID read_hw(POP6_CTX c)
     c->Hw.Ac        = FALSE;
     c->Hw.Curr      = CURR_UNMEASURED;
 
+    // bq27411 читаем по I2C - в SPMI не лезем
+    read_temp(c);
+    read_capacity(c);
+    read_remaining(c);
+
     // напряжение читаем первым если оно не читается дальше идти нет смысла
     // soc останется FALSE и попадем в ветку B или C ниже
     if (read_vbat(c)) {
         read_usb(c);
         read_ibat(c);
-        read_temp(c);
         soc = read_soc(c);
     } else {
         // шина молчит значит про кабель ничего не знаем
@@ -578,7 +639,7 @@ static VOID read_hw(POP6_CTX c)
         c->Hw.Ac = ac;
     }
 
-    /*
+     /*
      батарея рабочая только если прочитали и напряжение и проценты
      если прочитали только напряжение значит железо еще не проснулось
      регистр 0x41A0 уже может отдавать валидные милливольты
@@ -702,19 +763,21 @@ VOID HwRestoreCharge(POP6_CTX c)
 static VOID hw_diag(POP6_CTX c)
 {
     // читаем те же регистры что писал unlock
-    // порядок тут такой же как порядок полей в логе ниже
-    // cfg2 до unlock это режим от загрузчика бит 7 значит hardware
-    // vflt pre fcc afst показывают что записала seq в unlock
+    // порядок значений = порядок regs[] и групп
+    // 
+    // 17 статусных | vflt pre fcc afst | vraw iraw cap cap
+    // | vbat soc curr ac temp | valid fail fast chgoff
+    // | bq fcc dcap rc full design hwcap
     static const USHORT regs[] = {
-        USB_LOAD, USB_OPT, USB_FLOAT, USB_APSD, USB_ICL,
-        ICL_MAX_STS, ICL_STS, CHG_STS, CHG_EN, CHG_CFG2, CHG_WD_SNARL,
-        PWR_PATH_STS, USB_IN_STATUS, APSD_STS, APSD_RES, USB_STS, USB_SUSP,
-        CHG_FLOAT, CHG_PRE, CHG_FCC, CHG_FAST,
+        USB_LOAD,     USB_OPT,       USB_FLOAT, USB_APSD, USB_ICL,
+        ICL_MAX_STS,  ICL_STS,       CHG_STS,   CHG_EN,   CHG_CFG2, CHG_WD_SNARL,
+        PWR_PATH_STS, USB_IN_STATUS, APSD_STS,  APSD_RES, USB_STS,  USB_SUSP,
+        CHG_FLOAT,    CHG_PRE,       CHG_FCC,   CHG_FAST,
     };
-    UCHAR  v[RTL_NUMBER_OF(regs)] = { 0 };
+
+    UCHAR  v[RTL_NUMBER_OF(regs)] = { 0 }, cap[2] = { 0 };
     USHORT vraw = 0, iraw = 0;
-    UCHAR  cap[2] = { 0 };
-    ULONG  i;
+    ULONG  fcc = 0, dcap = 0, rc = 0, i;
 
     for (i = 0; i < RTL_NUMBER_OF(regs); i++)
         spmi_rd(c, regs[i], &v[i], 1);
@@ -724,13 +787,25 @@ static VOID hw_diag(POP6_CTX c)
     rdw(c, FG_IBAT, &iraw);
     spmi_rd(c, FG_SOC, cap, 2);
 
-    DbgLog("diag: ovr65=%02X opt=%02X flt=%02X rerun=%02X set=%02X icl6=%02X icl7=%02X chg=%02X en=%02X cfg2=%02X wd=%02X pps=%02X apsd6=%02X apsd7=%02X apsd8=%02X ists=%02X lim=%02X | vflt=%02X pre=%02X fcc=%02X afst=%02X | vraw=%04X iraw=%04X cap=%02X/%02X | vbat=%lu soc=%lu curr=%ld ac=%u temp=%lu valid=%u fail=%lu fast=%u chgoff=%u",
-           v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9],
-           v[10], v[11], v[12], v[13], v[14], v[15], v[16],
+    // bq27411 сырье читаем тож напрямую
+    i2c_rd(c, BQ27411_REG_FCC,  &fcc);
+    i2c_rd(c, BQ27411_REG_DCAP, &dcap);
+    i2c_rd(c, BQ27411_REG_RC,   &rc);
+
+    DbgLog("diag: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X"
+           " | %02X %02X %02X %02X"
+           " | %04X %04X %02X %02X"
+           " | %lu %lu %ld %u %lu"
+           " | %u %lu %u %u"
+           " | %lu %lu %lu %lu %lu %lu",
+           v[0], v[1], v[2], v[3], v[4],
+           v[5], v[6], v[7], v[8], v[9], v[10],
+           v[11], v[12], v[13], v[14], v[15], v[16],
            v[17], v[18], v[19], v[20],
            vraw, iraw, cap[0], cap[1],
            c->Hw.Volt, c->Hw.Soc, c->Hw.Curr, c->Hw.Ac, c->Hw.Temp,
-           c->Hw.Valid, c->SpmiFail, c->Fast, c->ChgOff);
+           c->Hw.Valid, c->SpmiFail, c->Fast, c->ChgOff,
+           fcc, dcap, rc, c->Full, c->Design, c->Hw.Cap);
 }
 
 // -=-=-=-=-=-=-=-= опрос =-=-=-=-=-=-=-=
@@ -756,8 +831,7 @@ VOID HwPoll(POP6_CTX c)
             прямая запись 0x01 (не RMW)
             как в стоковом wdog_bark_irq_handler
         */
-        if (c->SpmiWrite)
-            wrb(c, CHG_WD_PET, MASK_NONE, CHG_WD_PET_VAL);
+        wrb(c, CHG_WD_PET, MASK_NONE, CHG_WD_PET_VAL);
 
         if (c->Fast && !temp_in(c, FALSE)) {
             /*
@@ -768,7 +842,7 @@ VOID HwPoll(POP6_CTX c)
 
                 ChgOff значит CHG_EN погасили мы сами и HwExit потом включит его обратно
             */
-            if (c->SpmiWrite && wrb(c, CHG_EN, MASK_EN, 0)) {
+            if (wrb(c, CHG_EN, MASK_EN, 0)) {
                 c->Fast   = FALSE;
                 c->ChgOff = TRUE;
             }

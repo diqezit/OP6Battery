@@ -62,7 +62,7 @@ static NTSTATUS IoctlTorch(POP6_CTX c, PIRP Irp, ULONG inLen)
     if (inLen < sizeof(*req))
         return IrpComplete(Irp, STATUS_BUFFER_TOO_SMALL, 0);
 
-    if (!req || !c)
+    if (!req)
         return IrpComplete(Irp, STATUS_INVALID_PARAMETER, 0);
 
     return IrpComplete(Irp, TorchSet(c, req->Brightness), 0);
@@ -80,12 +80,10 @@ static NTSTATUS EvtIoctl(WDFDEVICE Dev, PIRP Irp)
     if (code == IOCTL_OP6_TORCH_SET)
         return IoctlTorch(c, Irp, sp->Parameters.DeviceIoControl.InputBufferLength);
 
-    if (c != NULL) {
-        WdfWaitLockAcquire(c->ClassLock, NULL);
-        if (c->Class != NULL)
-            st = BatteryClassIoctl(c->Class, Irp);
-        WdfWaitLockRelease(c->ClassLock);
-    }
+    WdfWaitLockAcquire(c->ClassLock, NULL);
+    if (c->Class != NULL)
+        st = BatteryClassIoctl(c->Class, Irp);
+    WdfWaitLockRelease(c->ClassLock);
 
     // не наш IOCTL - отдаем вниз по стеку
     if (st == STATUS_NOT_SUPPORTED) {
@@ -100,17 +98,13 @@ static NTSTATUS EvtIoctl(WDFDEVICE Dev, PIRP Irp)
 
 // таймер запускают и останавливают 4 колбэка
 //
-// Timer может быть NULL если WdfTimerCreate провалилась в EvtAdd
-//
 // таймер разовый - KMDF не разрешает periodic вместе с Passive
 // поэтому EvtTimer сам заводит следующий тик
 // Run = TRUE пока EvtTimer должен перезапускать себя
 static VOID TimerRun(POP6_CTX c, ULONG ms)
 {
-    if (c->Timer) {
-        c->Run = TRUE;
-        WdfTimerStart(c->Timer, WDF_REL_TIMEOUT_IN_MS(ms));
-    }
+    c->Run = TRUE;
+    WdfTimerStart(c->Timer, WDF_REL_TIMEOUT_IN_MS(ms));
 }
 
 static VOID TimerHalt(POP6_CTX c)
@@ -122,8 +116,7 @@ static VOID TimerHalt(POP6_CTX c)
     // тут только TRUE
     // FALSE НЕ применять!!
     // иначе SPMI и mailbox - опрос продолжит работу с мертвыми ресурсами
-    if (c->Timer)
-        WdfTimerStop(c->Timer, TRUE);
+    WdfTimerStop(c->Timer, TRUE);
 }
 
 static VOID EvtTimer(WDFTIMER Timer)
@@ -141,10 +134,27 @@ static VOID EvtTimer(WDFTIMER Timer)
     BOOLEAN        nv = c->NotifyValid;
     WdfSpinLockRelease(c->SnapLock);
 
-    // power manager будим пока заряд за порогом BATTERY_NOTIFY
-    // и при смене состояния
-    BOOLEAN low  = nv && (n.LowCapacity  != BATTERY_UNKNOWN_CAPACITY) && (c->Hw.Cap <= n.LowCapacity);
-    BOOLEAN high = nv && (n.HighCapacity != BATTERY_UNKNOWN_CAPACITY) && (c->Hw.Cap >= n.HighCapacity);
+    /*
+        будим power manager когда заряд вышел за порог BATTERY_NOTIFY
+        и когда состояние поменялось
+
+        пороги сравниваем только если сразу три условия
+        уведомление валидно nv
+        емкость прочитана capKnown
+        сам порог задан а не UNKNOWN
+        если хотя бы одно не выполнено то low и high остаются FALSE
+    */
+    BOOLEAN capKnown = (c->Full != 0);
+    BOOLEAN low  = FALSE;
+    BOOLEAN high = FALSE;
+
+    if (nv && capKnown) {
+        if (n.LowCapacity != BATTERY_UNKNOWN_CAPACITY)
+            low = (c->Hw.Cap <= n.LowCapacity);
+
+        if (n.HighCapacity != BATTERY_UNKNOWN_CAPACITY)
+            high = (c->Hw.Cap >= n.HighCapacity);
+    }
 
     // подтвержденный критический заряд (BattCommit CRIT_CONFIRM опросов)
     // класс должен узнать сразу независимо от выставленных им порогов
@@ -245,7 +255,6 @@ static NTSTATUS EvtPrepareHardware(
 
         st = WdfIoTargetCreate(Dev, &at, &c->I2cTarget);
         if (!NT_SUCCESS(st)) {
-            c->I2cTarget = NULL;
             DbgLog("i2c: create 0x%08X", (ULONG)st);
             break;
         }
@@ -276,30 +285,32 @@ static NTSTATUS EvtReleaseHardware(WDFDEVICE Dev, WDFCMRESLIST ResourcesTranslat
 }
 
 /*
-    прочитать n байт регистра reg с bq27411
+    прочитать 16-битный регистр reg с bq27411 (младший байт первым)
     write-then-read одной SPB-последовательностью
-    TRUE только если драйвер шины вернул не меньше n байт
+    TRUE только если драйвер шины вернул не меньше двух байт
+    FALSE = нет ответа, значение по указателю не трогаем
 
-    пара к spmi_rd: без I2cTarget сразу FALSE
-    буфер вызывающего зануляем чтобы частичный мусор не ушел вверх
+    все нужные регистры bq27411 16-битные поэтому слово собираем
+    здесь и вызов одной строкой как rdw у зарядника
 */
-BOOLEAN i2c_rd(POP6_CTX c, UCHAR reg, PUCHAR buf, ULONG n)
+BOOLEAN i2c_rd(POP6_CTX c, UCHAR reg, PULONG v)
 {
     SPB_TRANSFER_LIST_AND_ENTRIES(2) xfer;
     WDF_MEMORY_DESCRIPTOR mem;
+    UCHAR b[2] = { 0 };
     ULONG_PTR bytes = 0;
     NTSTATUS st;
 
     if (!c->I2cTarget) return FALSE;
 
-    RtlZeroMemory(buf, n);
+    RtlZeroMemory(b, sizeof(b));
 
     SPB_TRANSFER_LIST_INIT(&xfer.List, 2);
     xfer.List.Transfers[0] = SPB_TRANSFER_LIST_ENTRY_INIT_SIMPLE(
         SpbTransferDirectionToDevice, 0, &reg, sizeof(reg));
 #pragma warning(suppress: 6201)
     xfer.List.Transfers[1] = SPB_TRANSFER_LIST_ENTRY_INIT_SIMPLE(
-        SpbTransferDirectionFromDevice, 0, buf, n);
+        SpbTransferDirectionFromDevice, 0, b, sizeof(b));
 
     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&mem, &xfer, sizeof(xfer));
 
@@ -307,7 +318,11 @@ BOOLEAN i2c_rd(POP6_CTX c, UCHAR reg, PUCHAR buf, ULONG n)
         c->I2cTarget, NULL, IOCTL_SPB_EXECUTE_SEQUENCE,
         &mem, NULL, NULL, &bytes);
 
-    return (BOOLEAN)(NT_SUCCESS(st) && bytes >= n);
+    if (!NT_SUCCESS(st) || bytes < sizeof(b))
+        return FALSE;
+
+    *v = MAKE_USHORT_LE(b[0], b[1]);
+    return TRUE;
 }
 
 // -=-=-=-=-=-=-=-= очистка SPMI =-=-=-=-=-=-=-=
@@ -387,7 +402,7 @@ static BOOLEAN try_open_spmi(POP6_CTX c)
 
     UNICODE_STRING u;
     WDF_IO_TARGET_OPEN_PARAMS op;
-    NTSTATUS st = STATUS_UNSUCCESSFUL;
+    NTSTATUS st;
     ULONG i;
 
     for (i = 0; i < RTL_NUMBER_OF(name); i++) {
@@ -443,12 +458,12 @@ VOID ensure_spmi(POP6_CTX c)
 
         Context указывает на саму структуру (самоссылка в декомпиляте)
         а провайдерский список в контексте файла держит этот же адрес
-        локальная переменная = разыменование мёртвого стека
+        локальная переменная = разыменование мертвого стека
         в SpmiTeardown и в очистке провайдера при закрытии target (CWE-825)
     */
     QCOM_SPMI* iface = &c->Spmi;
     BOOLEAN opened = FALSE;
-    NTSTATUS st = STATUS_UNSUCCESSFUL;
+    NTSTATUS st;
 
     /*
         при удалении шины (query-remove или удаление устройства)
@@ -518,8 +533,6 @@ VOID ensure_spmi(POP6_CTX c)
         DbgLog("spmi: query iface failed: 0x%08X", (ULONG)st);
         goto cleanup;
     }
-
-    DbgLog("spmi: ctx_self=%u", (ULONG)(iface->Context == (PVOID)iface));
 
     /*
         ссылка на интерфейс взята с этого момента ее снимает SpmiTeardown
@@ -638,6 +651,7 @@ VOID HwInit(POP6_CTX c)
     }
 
     c->Mailbox = (PVOID)m;
+    c->Hw.Cap = BATTERY_UNKNOWN_CAPACITY;
 
     /*
         ждем SPMI_INIT_DELAY опросов прежде чем тронуть шину
@@ -768,13 +782,7 @@ static NTSTATUS EvtAdd(WDFDRIVER Drv, PWDFDEVICE_INIT Di)
     // WdfObjectDelete(dev) звать нельзя - для WDFDEVICE это запрещено
     c = GetCtx(dev);
     c->Device    = dev;
-    c->I2cTarget = NULL;
     c->Tag       = 1;                     // телефон всегда имеет батарею
-
-    // пока не отдает эти значения знач берем константы
-    c->Full   = FULL_MWH;
-    c->Design = DESIGN_MWH;
-    c->Cycles = DEFAULT_CYCLES;
 
     (VOID)WdfDeviceCreateDeviceInterface(dev, &GUID_DEVINTERFACE_OP6_TORCH, NULL);
 
@@ -797,11 +805,8 @@ static NTSTATUS EvtAdd(WDFDRIVER Drv, PWDFDEVICE_INIT Di)
     tc.AutomaticSerialization = FALSE;
     at.ExecutionLevel = WdfExecutionLevelPassive;
 
-    // Timer зануляем явно: TimerRun и TimerHalt проверяют его на NULL
-    c->Timer = NULL;
     st = WdfTimerCreate(&tc, &at, &c->Timer);
     if (!NT_SUCCESS(st)) {
-        c->Timer = NULL;       // не оставляем мусор в хэндле
         DbgLog("EvtAdd: timer 0x%08X", (ULONG)st);
         return st;
     }

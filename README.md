@@ -180,7 +180,7 @@ if (h != INVALID_HANDLE_VALUE) {
 | # | Register | Write | Meaning |
 |---|---|---|---|
 | 1 | `CHG_CFG2` (1051) | mask 0xC0 <- 0 | `CHG_EN` source = register |
-| 2 | `CHG_FLOAT` (1070) | 0x73 | 4.35 V |
+| 2 | `CHG_FLOAT` (1070) | 0x78 | 4.390 V |
 | 3 | `CHG_PRE` (1060) | 0x3C | precharge 1500 mA |
 | 4 | `CHG_FCC` (1061) | 0x50 | charge 2000 mA |
 | 5 | `USB_FLOAT` (1363) | bit 0 | FLOAT detect -> SDP |

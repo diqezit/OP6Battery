@@ -55,6 +55,7 @@ echo [OK] Files staged. Installing from the protected folder only.
 set "SYS=%STAGE%\OP6Battery.sys"
 set "INF=%STAGE%\OP6Battery.inf"
 set "CER=%STAGE%\OP6Battery.cer"
+set "OEMFILE=%STAGE%\oem.txt"
 
 if not defined EXP_SHA goto :nohash
 set "ACT_SHA="
@@ -91,21 +92,28 @@ if errorlevel 1 (
 echo.
 echo [2/5] Installing test certificate...
 if exist "%CER%" (
-    certutil -addstore Root "%CER%" 1>nul 2>nul
+    certutil -f -addstore "Root" "%CER%" 1>nul 2>nul
     if errorlevel 1 (
         echo [ERROR] Failed to add certificate to Root store.
         echo.
         pause 1>nul
         exit /b 1
     )
-    certutil -addstore TrustedPublisher "%CER%" 1>nul 2>nul
+    certutil -f -addstore "TrustedPublisher" "%CER%" 1>nul 2>nul
     if errorlevel 1 (
         echo [ERROR] Failed to add to TrustedPublisher store.
         echo.
         pause 1>nul
         exit /b 1
     )
-    echo [OK] Certificate installed.
+    certutil -f -addstore "TrustedPeople" "%CER%" 1>nul 2>nul
+    if errorlevel 1 (
+        echo [ERROR] Failed to add to TrustedPeople store.
+        echo.
+        pause 1>nul
+        exit /b 1
+    )
+    echo [OK] Certificate installed to Root, TrustedPublisher, TrustedPeople.
 ) else (
     echo [WARN] OP6Battery.cer not found, skipping.
 )
@@ -123,8 +131,27 @@ if not errorlevel 1 (
 
 echo.
 echo [4/5] Installing driver via pnputil...
-pnputil /add-driver "%INF%" /install
+set "DRVLOG=%TEMP%\op6bat_pnputil.log"
+pnputil /add-driver "%INF%" /install > "%DRVLOG%" 2>&1
 set "PNP_RC=%errorlevel%"
+type "%DRVLOG%"
+
+set "OEM_NAME="
+for /f "usebackq tokens=*" %%L in ("%DRVLOG%") do (
+    for %%W in (%%L) do (
+        echo %%W| findstr /R /I /X "oem[0-9][0-9]*\.inf" 1>nul 2>nul && set "OEM_NAME=%%W"
+    )
+)
+del "%DRVLOG%" 1>nul 2>nul
+
+if defined OEM_NAME (
+    > "%OEMFILE%" echo %OEM_NAME%
+    echo [OK] Driver stored as %OEM_NAME%, name saved for uninstall.
+) else (
+    echo [WARN] Could not capture the stored driver name.
+    echo        Uninstall will scan the driver store instead.
+)
+
 if not "%PNP_RC%"=="0" (
     echo [WARN] pnputil /add-driver returned %PNP_RC%.
 )
@@ -189,14 +216,25 @@ exit /b 0
 
 :uninstall
 echo [1/4] Removing OP6Battery driver packages...
+set "OEMFILE=%STAGE%\oem.txt"
 set "DEL_ANY=0"
 set "LAST="
+
 for /f "tokens=1,* delims=:" %%A in ('pnputil /enum-drivers 2^>nul') do (
     for /f "tokens=*" %%V in ("%%B") do (
-        echo %%V| findstr /R /I /X "oem[0-9]*\.inf" 1>nul 2>nul && set "LAST=%%V"
+        echo %%V| findstr /R /I /X "oem[0-9][0-9]*\.inf" 1>nul 2>nul && set "LAST=%%V"
         if /I "%%V"=="op6battery.inf" call :deldrv
     )
 )
+
+if "%DEL_ANY%"=="0" if exist "%OEMFILE%" (
+    for /f "usebackq tokens=*" %%O in ("%OEMFILE%") do (
+        echo [INFO] Trying saved driver package name %%O ...
+        set "LAST=%%O"
+        call :deldrv
+    )
+)
+
 if "%DEL_ANY%"=="0" echo [INFO] No OP6Battery driver package found.
 
 echo.
@@ -209,7 +247,8 @@ for /f "delims=" %%T in ('powershell -NoProfile -Command "(New-Object System.Sec
 if not defined THUMB goto :nocer
 certutil -delstore Root %THUMB% 1>nul 2>nul
 certutil -delstore TrustedPublisher %THUMB% 1>nul 2>nul
-echo [OK] Certificate %THUMB% removed from Root and TrustedPublisher.
+certutil -delstore TrustedPeople %THUMB% 1>nul 2>nul
+echo [OK] Certificate %THUMB% removed from Root, TrustedPublisher, TrustedPeople.
 goto :cerdone
 :nocer
 echo [WARN] OP6Battery.cer not found, remove the certificate manually ^(certlm.msc^).
@@ -244,8 +283,11 @@ exit /b 0
 :deldrv
 if not defined LAST exit /b 0
 pnputil /delete-driver %LAST% /uninstall /force 1>nul 2>nul
-if errorlevel 1 (
-    echo [WARN] Could not remove %LAST%.
+set "DELRC=%errorlevel%"
+if "%DELRC%"=="3010" (
+    echo [OK] Removed %LAST% ^(reboot required^).
+) else if not "%DELRC%"=="0" (
+    echo [WARN] Could not remove %LAST% ^(error %DELRC%^).
 ) else (
     echo [OK] Removed %LAST%.
 )

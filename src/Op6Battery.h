@@ -3,7 +3,6 @@
 
 #include <ntddk.h>
 #include <wdf.h>
-#include <wmilib.h>     // WMILIB_CONTEXT для BatteryClassSystemControl
 #include <batclass.h>   // BATTERY_TAG_INVALID, BATTERY_NOTIFY, BATTERY_UNKNOWN_*
 
 // -=-=-=-=-=-=-=-= хелперы =-=-=-=-=-=-=-=
@@ -17,7 +16,7 @@
         } \
     } while (0)
 
-// то же + Close, если I/O target ещё открыт
+// то же + Close, если I/O target еще открыт
 #define WDF_IOTARGET_DELETE_SAFE(p) \
     do { \
         if (p) { \
@@ -46,6 +45,12 @@
 // регистр температуры BQ27411 (команда 0x02, формат 0.1 K)
 #define BQ27411_REG_TEMP 0x02
 
+// регистры емкости bq27411 в мАч LSB-first как температура
+// адреса и формат из mainline bq27xxx_battery.c (мапа bq27411 = bq27421)
+#define BQ27411_REG_RC   0x0C     // RemainingCapacity остаток
+#define BQ27411_REG_FCC  0x0E     // FullChargeCapacity выученная
+#define BQ27411_REG_DCAP 0x3C     // DesignCapacity паспортная
+
 // зажать значение в диапазон [lo, hi]
 // используется при вычислениях SOC ICL и подобных
 #define OP6_CLAMP(v, lo, hi) min(max((v), (lo)), (hi))
@@ -66,8 +71,7 @@
 
 #define SOC_PCT_FULL    100         // процент полной батареи
 
-#define SOC_RAW_MIN     1           // границы сырого диапазона SOC
-#define SOC_RAW_MAX     254
+#define SOC_RAW_MIN     1           // нижняя граница сырого диапазона SOC
 
 #define SOC_SPREAD      98          // растяжка 1..254 в 1..99 и округление к ближайшему
 #define SOC_ROUND       0x7E
@@ -87,37 +91,6 @@
     инициализацию на шине SPMI без коллизий
 */
 #define FIRST_POLL_MS 4000
-
-// -=-=-=-=-=-=-=-= железо по умолчанию =-=-=-=-=-=-=-=
-
-// паспортная емкость BLP657 по даташиту
-// стартовое значение c->Design (EvtAdd) уходит в QInfo.DesignedCapacity
-#define DESIGN_MWH 12705
-
-// реальная емкость после деградации
-// стартовое значение c->Full (EvtAdd) пока железо не отдало свое
-#define FULL_MWH 11088
-
-// число циклов если железо не отдало счетчик
-#define DEFAULT_CYCLES 240
-
-// -=-=-=-=-=-=-=-= валидация батареи =-=-=-=-=-=-=-=
-
-// ниже этого напряжения данные считаются мусором
-// батарея физически не может быть разряжена сильнее
-#define VBAT_MIN_MV 2500
-
-// выше этого напряжения данные считаются мусором
-// литий не заряжается выше 4.5 В
-#define VBAT_MAX_MV 4500
-
-// нижний предел валидной температуры в 0.1 K
-// ниже 250 K (-23 C) батарея не работает
-#define TEMP_MIN_K10 2500
-
-// верхний предел валидной температуры в 0.1 K
-// выше 350 K (77 C) начинается возгорание
-#define TEMP_MAX_K10 3500
 
 /*
     сколько раз пробуем перечитать SOC
@@ -167,9 +140,15 @@
 */
 #define CRIT_CONFIRM 3
 
-// мощность разряда в мВт ниже этого - шум датчика
-// оценку времени работы по ней не считаем
-#define RATE_NOISE_MW 50
+// ток разряда в мА ниже этого - шум датчика
+// оценку времени работы по нему не считаем
+#define RATE_NOISE_MA 50
+
+// номинал банки BLP657 по спецификации 3.85 В
+// множитель мА·ч bq27411 -> мВт·ч Windows
+// живой вольтаж нельзя: Full кэшируется на теге раз и навсегда
+// а Cap отдается каждый опрос - рассинхрон даст Cap > Full и % за 100
+#define BATT_NOMINAL_MV 3850
 
 // -=-=-=-=-=-=-=-= эвристики состояния =-=-=-=-=-=-=-=
 
@@ -188,7 +167,7 @@
 /*
     ноль тока означает "датчик не ответил"
     настоящий ровно нулевой ток тоже попадает сюда
-    на расчёты не влияет: Rate в этом случае BATTERY_UNKNOWN_RATE
+    на расчеты не влияет: Rate в этом случае BATTERY_UNKNOWN_RATE
 */
 #define CURR_UNMEASURED 0
 
@@ -270,17 +249,9 @@
 // (дефолтные 250-500 мА не покрывают потребление Windows 11 ARM)
 #define CHG_PRE_VAL 0x3C
 
-/*
-    termination current
-    при каком токе заряд считается завершенным
-    сейчас не пишется: регистр CHG_TERM есть в smb-reg.h
-    (TCCC_CHARGE_CURRENT_TERMINATION_CFG) но семантика значения не проверена
-*/
-#define CHG_TERM_VAL 5
-
 // float voltage шаг 7.5 мВ база 3.4875 В
-// 4.35 В = 0x73 как ChgFvMax в конфиге вендора
-#define CHG_FLOAT_VAL ((4350000 - 3487500) / 7500)
+// 4.390 В = 0x78 как ChgFvMax в конфиге вендора
+#define CHG_FLOAT_VAL ((4390000 - 3487500) / 7500)
 
 // разрешенный диапазон температуры для зарядки в 0.1 K
 // вышли из диапазона - CHG_EN гасится в том числе во время заряда
@@ -410,7 +381,6 @@ enum {
     CHG_CFG2 = 0x1051,              // CHGR_CFG2: источник и полярность CHG_EN
     CHG_PRE = 0x1060,
     CHG_FCC = 0x1061,
-    CHG_TERM = 0x1063,              // TCCC_CHARGE_CURRENT_TERMINATION_CFG (есть в smb-reg.h) в unlock не пишется
     CHG_FLOAT = 0x1070,
 
     // DCDC (база 0x1100) входной тракт и лимит тока
@@ -434,7 +404,6 @@ enum {
     // MISC (база 0x1600) watchdog зарядника
     CHG_WD_PET = 0x1643,            // BARK_BITE_WDOG_PET: запись 0x01 сбрасывает watchdog зарядника
                                     // выполняется прямой записью байта, без read-modify-write
-    CHG_WD_CFG = 0x1651,            // WD_CFG
     CHG_WD_SNARL = 0x1653,          // SNARL_BARK_BITE_WD_CFG
 
     // FG (база 0x4000) топливомер
@@ -442,9 +411,7 @@ enum {
     // по ним один раз проверяем что адресация SPMI попадает именно в PMI8998
     FG_SOC_SUBTYPE = 0x4005,        // PERPH_SUBTYPE блока BATT_SOC
     FG_SOC = 0x4009,
-    FG_SOC_STS = 0x4010,            // BATT_SOC INT_RT_STS: бит 1 = SOC_READY
     FG_INFO_SUBTYPE = 0x4105,       // PERPH_SUBTYPE блока BATT_INFO
-    FG_TEMP = 0x4150,
     FG_VBAT = 0x41A0,
     FG_IBAT = 0x41A2,
 
@@ -469,15 +436,9 @@ enum {
 #define CHG_STS_MASK                GENMASK(2, 0) // 0x1006[2:0] состояние заряда
 
 // состояние заряда 0x1006[2:0]
+// 0 INHIBIT 1 TRICKLE 2 PRE 3 FULLON 4 TAPER 5 TERMINATE 6 PAUSE
 enum {
-    INHIBIT_CHARGE = 0,            // удержание (батарея близка к полной)
-    TRICKLE_CHARGE,                // капельный
-    PRE_CHARGE,                    // предзаряд
-    FULLON_CHARGE,                 // полный заряд - рабочее состояние
-    TAPER_CHARGE,                  // финальный сход тока
-    TERMINATE_CHARGE,              // завершен по условию
-    PAUSE_CHARGE,                  // пауза
-    DISABLE_CHARGE,                // 7: выключен - лечится фронтом CHG_EN 0 -> 1
+    DISABLE_CHARGE = 7,            // выключен - лечится фронтом CHG_EN 0 -> 1
 };
 
 // USBIN вход и детектор источника
@@ -570,10 +531,10 @@ typedef struct {
 typedef struct _OP6_SNAP {
     ULONG   Volt;       // напряжение в мВ
     ULONG   Soc;        // заряд в процентах 0..100
-    ULONG   Cap;        // абсолютная емкость в мВт/ч
+    ULONG   Cap;        // остаток в мА·ч из bq27411 (RC)
     ULONG   Temp;       // температура в 0.1 K 0 = не прочитана
     LONG    Curr;       // ток в мА отрицательный при разряде 0 = не измерен
-    LONG    Rate;       // мощность в мВт Curr * Volt / 1000 или BATTERY_UNKNOWN_RATE
+    LONG    Rate;       // ток в мА (относительные единицы как Cap) или BATTERY_UNKNOWN_RATE
     BOOLEAN Ac;         // TRUE если есть внешнее питание сбрасывается в начале опроса
     BOOLEAN Charging;   // TRUE если идет активный заряд
     BOOLEAN Valid;      // TRUE после первого успешного чтения SOC+VBAT
@@ -611,11 +572,12 @@ typedef struct _OP6_CTX {
 
     PVOID       Mailbox;        // замапленный регион MB_PA или NULL
 
-    // статика: задается в EvtAdd после init не меняется
-    // читатели берут напрямую без лока
-    ULONG       Full;           // полная емкость в мВт/ч
-    ULONG       Design;         // проектная емкость в мВт/ч
-    ULONG       Cycles;         // число циклов заряда-разряда
+    // емкость заполняет read_capacity из bq27411
+    // значения почти статика и читатели берут их напрямую без лока
+    // единицы мАч родные для gauge в мВтч не переводим как в Linux
+    // Full == 0 значит еще не прочитана
+    ULONG       Full;           // полная емкость мАч (FCC 0x0E bq27411)
+    ULONG       Design;         // паспортная емкость мАч (DCAP 0x3C bq27411)
 
     // флаги потока опроса
     BOOLEAN     Fast;           // TRUE если зарядник уже настроен
@@ -674,8 +636,8 @@ VOID SpmiTeardown(POP6_CTX c, BOOLEAN is_open);
 // снять маппинг mailbox загрузчика
 VOID mailbox_unmap(POP6_CTX c);
 
-// чтение регистра bq27411 по I2C, таргет из PrepareHardware
-BOOLEAN i2c_rd(POP6_CTX c, UCHAR reg, PUCHAR buf, ULONG n);
+// чтение 16-битного регистра bq27411 по I2C, таргет из PrepareHardware
+BOOLEAN i2c_rd(POP6_CTX c, UCHAR reg, PULONG v);
 
 // фонарик: 0 = выкл, 1..100 = яркость. шину открывает сам
 NTSTATUS TorchSet(POP6_CTX c, UCHAR brightness);

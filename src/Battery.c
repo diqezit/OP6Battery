@@ -100,12 +100,8 @@ VOID BattCommit(POP6_CTX c)
           запасной путь на шумной шине: read_ibat не прочитал регистр
           но Ac из USB жив
     */
-    if (!h->Ac || c->ChgOff) {
+    if (!h->Ac || c->ChgOff || h->Curr < 0) {
         // нет сети или заряд погашен нами по температуре
-        h->Charging = FALSE;
-    }
-
-    else if (h->Curr < 0) {
         // измеренный разряд - НЕ заряд даже при кабеле
         h->Charging = FALSE;
     }
@@ -121,27 +117,25 @@ VOID BattCommit(POP6_CTX c)
     }
 
     /*
-        Capacity и Rate считаем здесь один раз
-        QStatus и QInfo читают готовые значения из снимка
+        Cap и Rate отдаем в мВт·ч и мВт
 
-        Cap = Full * Soc / 100 - абсолютная емкость в мВт-ч для текущего процента
-        Windows показывает "осталось X мВт-ч" и строит графики
+        Cap уже посчитан и переведен в мВт·ч (read_remaining)
+        остатка через SOC второго топливомера больше нет
+        процент Windows это Cap/Full одной микросхемы который совпадает с своим SOC gauge
 
-        Rate = Volt * Curr / 1000 - мощность в мВт (мВ * мА / 1000)
-        положительная при заряде отрицательная при разряде
+        Full == 0 значит емкость еще не прочитана
+        HwInit зовет HwPoll до BattAttach поэтому первый QInfo уже с FCC/DCAP
+        Tag=1 навсегда батарея несъемная Information не переспрашивают
 
         Curr == CURR_UNMEASURED (не измерен) отдаем BATTERY_UNKNOWN_RATE
         Windows покажет "вычисляем..." вместо мусорного числа
     */
-    h->Cap = c->Full * h->Soc / 100;
-
-    if (h->Curr != CURR_UNMEASURED) {
-        h->Rate = (LONG)((LONGLONG)h->Volt * h->Curr / 1000);
+    if (h->Curr == CURR_UNMEASURED) {
+        h->Rate = (LONG)BATTERY_UNKNOWN_RATE;
     }
 
     else {
-        // ток не измерен - мощность неизвестна
-        h->Rate = (LONG)BATTERY_UNKNOWN_RATE;
+        h->Rate = (LONG)((LONGLONG)h->Volt * h->Curr / 1000);
     }
 
     /*
@@ -223,6 +217,18 @@ VOID BattCommit(POP6_CTX c)
 
 // -=-=-=-=-=-=-=-= запрос тега =-=-=-=-=-=-=-=
 
+/*
+    батарея несъемная но пока емкость не прочитана - батареи для системы нет
+
+    тег это единственное что Windows переспрашивает сам
+    пока Full == 0 (bq27411 еще не отдал FCC/DCAP) отвечаем "нет батареи"
+    когда I2C ответит вернем 1 - для compbatt это новая батарея
+    и он прочитает Information уже с живыми числами
+
+    ровно так же отвечает simbatt когда батареи нет
+    пустой tag=1 был бы хуже: FullChargedCapacity кэшируется на теге
+    а второго запроса Information с тем же тегом не существует
+*/
 static NTSTATUS QTag(PVOID Ctx, PULONG Tag)
 {
     POP6_CTX c = Ctx;
@@ -230,8 +236,10 @@ static NTSTATUS QTag(PVOID Ctx, PULONG Tag)
     if (!Tag)
         return STATUS_INVALID_PARAMETER;
 
-    // батарея несъемная
-    *Tag = (c->Tag != BATTERY_TAG_INVALID) ? c->Tag : 1;
+    if (!c->Full)
+        return STATUS_NO_SUCH_DEVICE;
+
+    *Tag = 1;
     return STATUS_SUCCESS;
 }
 
@@ -252,9 +260,20 @@ static NTSTATUS QInfo(
 
     switch (Level) {
     case BatteryInformation: {
-        // designated init сам зануляет Reserved и CriticalBias
-        // technology = 1 значит перезаряжаемая батарея (как в ACPI)
-        // chemistry это ровно 4 байта без завершающего NUL а не строка
+        /*
+            designated init сам зануляет Reserved и CriticalBias
+            technology = 1 значит батарея перезаряжаемая
+            chemistry это 4 байта без NUL в конце а не строка
+
+            емкость как прочитал bq27411
+            FCC 0x0E FullChargedCapacity
+            DCAP 0x3C DesignedCapacity
+            пока Full == 0 QTag не отдает тег поэтому пустые числа
+            физически не могут попасть в этот кэш
+            Information читается только с уже готовым тегом
+
+            батарея абсолютная: емкости в мВт·ч приходят из PMI8998.c
+        */
         ULONG full = c->Full;
 
         BATTERY_INFORMATION b = {
@@ -265,32 +284,56 @@ static NTSTATUS QInfo(
             .FullChargedCapacity = full,
             .DefaultAlert1 = full / 20,  // 5%
             .DefaultAlert2 = full / 10,  // 10%
-            .CycleCount = c->Cycles,
+            .CycleCount = 0,             // bq27411 - циклов не имеет
         };
+
         return FILL_OBJ(b);
     }
 
     case BatteryGranularityInformation: {
-        BATTERY_REPORTING_SCALE gr = { 1, c->Full };
-        return FILL_OBJ(gr);
+        // шаг 1 мВт·ч
+        // предел - полная емкость из bq27411
+        BATTERY_REPORTING_SCALE scale = { 1, c->Full };
+
+        return FILL_OBJ(scale);
     }
 
     case BatteryEstimatedTime: {
-        // если запрос пришел с AtRate считаем по нему иначе по снимку
-        //
-        // rate в мВт (Curr * Volt / 1000) а не в мА
-        LONG rate = AtRate;
-        if (!rate)
-            rate = s.Rate;
+        /*
+            rate в мВт Cap в мВт·ч
+            Cap/rate это часы
 
-        // слабый разряд считаем шумом
-        // деление на малый rate дает огромное время и UI покажет мусор
-        // BATTERY_UNKNOWN_RATE (ток не измерен) время не дает:
-        // как LONG это минимальное число и прошло бы проверку на разряд
+            AtRate пришел в запросе берем его
+            иначе снимок с таймера
+        */
+        LONG rate = AtRate ? AtRate : s.Rate;
         ULONG secs = BATTERY_UNKNOWN_TIME;
-        if (s.Valid && !s.Ac && rate != (LONG)BATTERY_UNKNOWN_RATE &&
-            rate < -RATE_NOISE_MW)
-            secs = (ULONG)((ULONGLONG)s.Cap * 3600 / (ULONGLONG)-(LONGLONG)rate);
+
+        /*
+            емкость
+
+            Valid и Ac приходят по SPMI а Cap по I2C
+            бывает что SPMI живой а bq27411 замолчал
+            тогда Valid == TRUE но Cap == UNKNOWN
+            по такой емкости считать нельзя
+        */
+        BOOLEAN cap_ok = s.Valid && !s.Ac && s.Cap != BATTERY_UNKNOWN_CAPACITY;
+
+        /*
+            ток
+
+            BATTERY_UNKNOWN_RATE это LONG_MIN
+            он бы прошел проверку на разряд и дал мусор
+            а слабый разряд это шум
+            деление на маленький rate дает огромное время
+            и в UI попадут непонятные цифры
+        */
+        BOOLEAN rate_ok = rate != (LONG)BATTERY_UNKNOWN_RATE && rate < -RATE_NOISE_MA;
+
+        // нет емкости / тока то отдаем BATTERY_UNKNOWN_TIME
+        if (cap_ok && rate_ok)
+            secs = s.Cap * 3600 / -rate;
+
         return FILL_OBJ(secs);
     }
 
@@ -332,12 +375,13 @@ static NTSTATUS QStatus(PVOID Ctx, ULONG Tag, PBATTERY_STATUS St)
     SNAP_READ(s);
 
     // телеметрии нет (SPMI молчит дольше SPMI_FAIL_MAX)
-    // батарея несъемная - из системы не исчезает то показания неизвестны
+    // батарея несъемная - из системы не исчезает
+    // емкость это последний RC с bq27411 он от SPMI не зависит
     // обычно не доходим сюда а ета ветка оставлена как защита
     if (!s.Valid) {
         *St = (BATTERY_STATUS){
             .PowerState = 0,
-            .Capacity = BATTERY_UNKNOWN_CAPACITY,
+            .Capacity = s.Cap,
             .Voltage = BATTERY_UNKNOWN_VOLTAGE,
             .Rate = BATTERY_UNKNOWN_RATE,
         };
@@ -482,7 +526,6 @@ NTSTATUS BattAttach(POP6_CTX c)
     if (!NT_SUCCESS(st)) {
         // регистрация не прошла
         DbgLog("attach failed st=0x%08X", st);
-        return st;
     }
 
     return st;
