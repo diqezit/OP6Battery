@@ -48,18 +48,22 @@ static UCHAR torch_raw(UCHAR pct)
     иначе диод может мигнуть на остаточном токе без строба наоборот не бывает
     шины нет - не открываем: зовут из HwExit перед Teardown
 */
-VOID TorchOff(POP6_CTX c)
+BOOLEAN TorchOff(POP6_CTX c)
 {
-    if (!c->SpmiWrite) {
+    BOOLEAN ok;
+
+    if (!c->SpmiWrite) return FALSE;
+
+    ok  = torch_wr(c, FLASH_STROBE_CTRL, 0);
+    ok &= torch_wr(c, FLASH_LED1_CUR, 0);
+    ok &= torch_wr(c, FLASH_LED2_CUR, 0);
+
+    if (ok) {
         c->TorchOn = FALSE;
-        return;
+        DbgLog("torch: off");
     }
 
-    (VOID)torch_wr(c, FLASH_STROBE_CTRL, 0);
-    (VOID)torch_wr(c, FLASH_LED1_CUR, 0);
-    (VOID)torch_wr(c, FLASH_LED2_CUR, 0);
-    c->TorchOn = FALSE;
-    DbgLog("torch: off");
+    return ok;
 }
 
 // -=-=-=-=-=-=-=-= включение =-=-=-=-=-=-=-=
@@ -81,10 +85,9 @@ NTSTATUS TorchSet(POP6_CTX c, UCHAR brightness)
 {
     UCHAR raw;
 
-    if (!brightness) {
-        TorchOff(c);
-        return STATUS_SUCCESS;
-    }
+    // погашение не должно притворяться успехом
+    if (!brightness)
+        return TorchOff(c) ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
 
     // IOCTL может прийти до первого тика таймера
     ensure_spmi(c);
@@ -103,8 +106,7 @@ NTSTATUS TorchSet(POP6_CTX c, UCHAR brightness)
         !torch_wr(c, FLASH_STROBE_CFG, 0) ||
         !torch_wr(c, FLASH_STROBE_CTRL, TORCH_STROBE_LEDS)) {
 
-        (VOID)torch_wr(c, FLASH_STROBE_CTRL, 0);
-        c->TorchOn = FALSE;
+        (VOID)TorchOff(c);
         return STATUS_IO_DEVICE_ERROR;
     }
 
@@ -195,12 +197,15 @@ static BOOLEAN led_wr(POP6_CTX c, USHORT reg, UCHAR val)
     LSB биты 0..7 MSB бит 8
     пишем парой чтобы канал не мигнул на половинном значении
 */
-static VOID lpg_duty(POP6_CTX c, USHORT base, USHORT duty)
+static BOOLEAN lpg_duty(POP6_CTX c, USHORT base, USHORT duty)
 {
-    (VOID)led_wr(c, (USHORT)(base + LPG_PWM_VALUE_LSB),
-                 (UCHAR)(duty & LPG_DUTY_LSB_MASK));
-    (VOID)led_wr(c, (USHORT)(base + LPG_PWM_VALUE_MSB),
+    // TRUE = оба регистра скважности записаны
+    BOOLEAN ok = led_wr(c, (USHORT)(base + LPG_PWM_VALUE_LSB),
+                        (UCHAR)(duty & LPG_DUTY_LSB_MASK));
+
+    ok &= led_wr(c, (USHORT)(base + LPG_PWM_VALUE_MSB),
                  (UCHAR)((duty >> LPG_DUTY_MSB_SHIFT) & LPG_DUTY_MSB_MASK));
+    return ok;
 }
 
 /*
@@ -215,32 +220,35 @@ static VOID lpg_duty(POP6_CTX c, USHORT base, USHORT duty)
 
     duty512 = 0 канал гасим но бит 5 в ENABLE оставляем как в вендоре
 */
-static VOID lpg_chan_config(POP6_CTX c, USHORT base, USHORT duty512)
+static BOOLEAN lpg_chan_config(POP6_CTX c, USHORT base, USHORT duty512)
 {
     ULONG i;
+    BOOLEAN ok = TRUE;
 
     if (duty512 > LPG_DUTY_MAX)
         duty512 = LPG_DUTY_MAX;
 
     for (i = 0; i < RTL_NUMBER_OF(lpg_seq); i++)
-        (VOID)led_wr(c, (USHORT)(base + lpg_seq[i].reg), lpg_seq[i].val);
+        ok &= led_wr(c, (USHORT)(base + lpg_seq[i].reg), lpg_seq[i].val);
 
     // Начальные значения ШИМ
-    lpg_duty(c, base, duty512);
+    ok &= lpg_duty(c, base, duty512);
 
     // Включение канала
     if (duty512) {
-        (VOID)led_wr(c, (USHORT)(base + LPG_PWM_ENABLE_CTL), LPG_VAL_EN_ON);
+        ok &= led_wr(c, (USHORT)(base + LPG_PWM_ENABLE_CTL), LPG_VAL_EN_ON);
 
         // Обход кремниевого бага
         // перезапись скважности после включения
-        lpg_duty(c, base, duty512);
+        ok &= lpg_duty(c, base, duty512);
     } else {
-        (VOID)led_wr(c, (USHORT)(base + LPG_PWM_ENABLE_CTL), LPG_VAL_EN_OFF);
+        ok &= led_wr(c, (USHORT)(base + LPG_PWM_ENABLE_CTL), LPG_VAL_EN_OFF);
     }
 
     // Синхронизация ШИМ
-    (VOID)led_wr(c, (USHORT)(base + LPG_PWM_SYNC), LPG_VAL_SYNC);
+    ok &= led_wr(c, (USHORT)(base + LPG_PWM_SYNC), LPG_VAL_SYNC);
+
+    return ok;
 }
 
 /*
@@ -248,18 +256,20 @@ static VOID lpg_chan_config(POP6_CTX c, USHORT base, USHORT duty512)
     (0,0,0) = выкл: гасим каналы и отключаем питание VPH_PWR
     шины нет - тихий выход: зовут из HwExit перед Teardown
 */
-VOID LedSetRgb(POP6_CTX c, UCHAR r, UCHAR g, UCHAR b)
+BOOLEAN LedSetRgb(POP6_CTX c, UCHAR r, UCHAR g, UCHAR b)
 {
     UCHAR rgb[3] = { r, g, b };
     UCHAR triEn = 0;
     UCHAR src = TRI_LED_SRC_OFF;
+    BOOLEAN ok = TRUE;
     ULONG i;
 
+    // FALSE чтобы вызывающий не зафиксировал состояние
     if (!c || !c->SpmiWrite || !c->SpmiBus)
-        return;
+        return FALSE;
 
     for (i = 0; i < RTL_NUMBER_OF(led_chan); i++) {
-        lpg_chan_config(c, led_chan[i].reg,
+        ok &= lpg_chan_config(c, led_chan[i].reg,
             (USHORT)(((ULONG)rgb[i] * LPG_DUTY_MAX) / LED_RGB_MAX));
         if (rgb[i])
             triEn |= led_chan[i].val;
@@ -268,10 +278,12 @@ VOID LedSetRgb(POP6_CTX c, UCHAR r, UCHAR g, UCHAR b)
     // Источник питания: VPH_PWR если каналы включены иначе выкл
     if (triEn)
         src = TRI_LED_SRC_VPH_PWR;
-    (VOID)led_wr(c, TRI_LED_SRC, src);
+    ok &= led_wr(c, TRI_LED_SRC, src);
 
     // Включение линий в Tri-LED
-    (VOID)led_wr(c, TRI_LED_EN, triEn);
+    ok &= led_wr(c, TRI_LED_EN, triEn);
+
+    return ok;
 }
 
 /*
@@ -285,7 +297,15 @@ VOID LedUpdateBattery(POP6_CTX c)
 {
     UCHAR state = LED_ST_OFF; // 0 = OFF, 1 = RED, 2 = YELLOW, 3 = GREEN
 
-    if (!c || !c->SpmiWrite || !c->SpmiBus || !c->Hw.Valid)
+    if (!c)
+        return;
+
+    if (!c->SpmiWrite || !c->SpmiBus) {
+        c->LastLedState = 0xFF;
+        return;
+    }
+
+    if (!c->Hw.Valid)
         return;
 
     if (c->LedManualOverride)
@@ -303,7 +323,12 @@ VOID LedUpdateBattery(POP6_CTX c)
     if (state == c->LastLedState)
         return;
 
-    c->LastLedState = state;
-    LedSetRgb(c, led_rgb[state][0], led_rgb[state][1], led_rgb[state][2]);
-    DbgLog("Led: battery state=%u soc=%lu ac=%u", state, c->Hw.Soc, c->Hw.Ac);
+    // фиксируем только после успешной записи
+    // если сбой то повтор на следующем опросе
+    if (LedSetRgb(c, led_rgb[state][0], led_rgb[state][1], led_rgb[state][2])) {
+        c->LastLedState = state;
+        DbgLog("Led: battery state=%u soc=%lu ac=%u", state, c->Hw.Soc, c->Hw.Ac);
+    } else {
+        c->LastLedState = 0xFF;
+    }
 }

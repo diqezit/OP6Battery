@@ -816,6 +816,9 @@ static VOID hw_diag(POP6_CTX c)
 */
 VOID HwPoll(POP6_CTX c)
 {
+    UCHAR chgsts;
+    BOOLEAN stop = FALSE;
+
     read_hw(c);
     BattCommit(c);
     LedUpdateBattery(c);
@@ -833,7 +836,21 @@ VOID HwPoll(POP6_CTX c)
         */
         wrb(c, CHG_WD_PET, MASK_NONE, CHG_WD_PET_VAL);
 
-        if (c->Fast && !temp_in(c, FALSE)) {
+        /*
+            гасим любой активный заряд а не только наш Fast
+            Fast теряется в SpmiTeardown а заряд мог включить загрузчик
+            CHG_STS любое состояние кроме DISABLE(7) = зарядчик работает
+        */
+        if (!temp_in(c, FALSE)) {
+            stop = c->Fast;
+
+            if (!stop) {
+                if (spmi_rd(c, CHG_STS, &chgsts, 1))
+                    stop = (chgsts & CHG_STS_MASK) != DISABLE_CHARGE;
+            }
+        }
+
+        if (stop) {
             /*
                 шла зарядка и температура ушла из окна или не прочитана
                 значит гасим CHG_EN и снимаем Fast

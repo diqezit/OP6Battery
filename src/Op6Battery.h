@@ -642,14 +642,18 @@ BOOLEAN i2c_rd(POP6_CTX c, UCHAR reg, PULONG v);
 // фонарик: 0 = выкл, 1..100 = яркость. шину открывает сам
 NTSTATUS TorchSet(POP6_CTX c, UCHAR brightness);
 
-// погасить без открытия шины: нет SpmiWrite - тихий выход
-VOID TorchOff(POP6_CTX c);
+// погасить без открытия шины
+// TRUE = точно погашен
+// FALSE = записи не дошли
+BOOLEAN TorchOff(POP6_CTX c);
 
 // строка в \SystemRoot\op6_debug.log формат как у printf только PASSIVE_LEVEL
 VOID DbgLog(PCSTR format, ...);
 
-// RGB-светодиод уведомлений: компоненты 0-255, (0,0,0) = выкл
-VOID LedSetRgb(POP6_CTX c, UCHAR r, UCHAR g, UCHAR b);
+// RGB-светодиод уведомлений
+// компоненты 0-255
+// (0,0,0) = выкл
+BOOLEAN LedSetRgb(POP6_CTX c, UCHAR r, UCHAR g, UCHAR b);
 
 // автоцвет по батарее: RED<20 YELLOW<90 GREEN>=90 при AC, без AC выкл; зовет HwPoll
 VOID LedUpdateBattery(POP6_CTX c);
