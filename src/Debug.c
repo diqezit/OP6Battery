@@ -1,8 +1,11 @@
 #include "Op6Battery.h"
 #include <ntstrsafe.h>
 
+#define ENABLE_DEBUG 0
+
 VOID DbgLog(PCSTR format, ...)
 {
+#if ENABLE_DEBUG
     CHAR buffer[512];
     size_t length = 0;
     va_list args;
@@ -49,4 +52,7 @@ VOID DbgLog(PCSTR format, ...)
         buffer, (ULONG)length, NULL, NULL);
 
     (VOID)ZwClose(fileHandle);
+#else
+    UNREFERENCED_PARAMETER(format);
+#endif
 }
